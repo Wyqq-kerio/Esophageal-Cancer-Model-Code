@@ -10,18 +10,17 @@ from sklearn.model_selection import train_test_split
 import shap
 import warnings
 import os
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
-# ------------------------------------------------------------------------------
-# 1. Configuration Class
-# ------------------------------------------------------------------------------
+
+
 class ClinicalConfig:
     """Configuration for Clinical Evaluation (Survival, DCA, Calibration)"""
-    # 替换为 01_Data_and_SHAP 跑出的数据路径
+
     DATA_PATH = r"data/result/labeled.csv" 
     
-    # 标签配置（根据你的任务选择 'OS' 或 'PFS'）
     TARGET_EVENT = "OS"       # 生存状态 (0/1)
     TARGET_TIME = "OS_m"      # 生存时间 (月)
     TIME_CANDIDATES = ["OS_m", "PFS_m"]  # 自动兼容可用的生存时间列
@@ -43,9 +42,16 @@ class ClinicalConfig:
     FONT_CONFIG = {'family': 'Times New Roman', 'fontsize': 18}
     DCA_THRESH_RANGE = (0, 1, 0.01)
 
-# ------------------------------------------------------------------------------
-# 2. Custom Objective (保持你的优化版本)
-# ------------------------------------------------------------------------------
+
+def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
+    if keywords is None:
+        keywords = ['treatment', 'TL', 'original']
+    scaler = StandardScaler()
+    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
+    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
+    return X
+
+
 class CustomLoglossObjective(object):
     def __init__(self, penalty=1.3, reward_factor=1.8):
         self.penalty = penalty
@@ -77,9 +83,7 @@ class CustomLoglossObjective(object):
             result.append((der1_combined, der2_combined))
         return result
 
-# ------------------------------------------------------------------------------
-# 3. Clinical Evaluation Functions (DCA & Calibration)
-# ------------------------------------------------------------------------------
+
 def calculate_net_benefit(thresh_group, y_pred_score, y_label):
     """计算模型的净收益 (Net Benefit)"""
     net_benefit = []
@@ -154,9 +158,7 @@ def plot_calibration_curve(y_true, prob_full, prob_lite, title):
     plt.tight_layout()
     plt.show()
 
-# ------------------------------------------------------------------------------
-# 4. Survival Analysis Functions (KM & C-Index)
-# ------------------------------------------------------------------------------
+
 def perform_survival_analysis(time_true, event_true, risk_scores, median_risk, title_prefix):
     """
     计算 C-index 并绘制 Kaplan-Meier 生存曲线
@@ -193,9 +195,7 @@ def perform_survival_analysis(time_true, event_true, risk_scores, median_risk, t
     plt.tight_layout()
     plt.show()
 
-# ------------------------------------------------------------------------------
-# 5. Main Execution
-# ------------------------------------------------------------------------------
+
 def main():
     config = ClinicalConfig()
     
@@ -220,12 +220,14 @@ def main():
     event_true = data[config.TARGET_EVENT].astype(float).astype(int).values
     X = data.drop([time_col, config.TARGET_EVENT], axis=1, errors='ignore')
     
-    # 分类变量处理
-    actual_cat_features = [col for col in config.CAT_FEATURES if col in X.columns]
-    X[actual_cat_features] = X[actual_cat_features].astype(str)
-    num_features = [col for col in X.columns if col not in actual_cat_features]
-    X[num_features] = X[num_features].astype(float)
-    cat_features_indices = [X.columns.get_loc(col) for col in actual_cat_features]
+    # 与 Active Learning_1.0.py 保持一致：先标准化指定字段，再前13列视作分类特征
+    X = standardize_selected_features(X)
+    cat_features_count = min(13, X.shape[1])
+    cat_features_indices = list(range(cat_features_count))
+    cat_cols = X.columns[cat_features_indices].tolist()
+    X[cat_cols] = X[cat_cols].astype(str)
+    num_cols = X.columns[cat_features_count:]
+    X[num_cols] = X[num_cols].astype(float)
 
     # 划分训练/测试集
     X_train, X_test, y_train, y_test, time_train, time_test = train_test_split(
@@ -257,7 +259,7 @@ def main():
     
     X_train_lite = X_train[top_15_features]
     X_test_lite = X_test[top_15_features]
-    lite_cat_features_indices = [i for i, col in enumerate(top_15_features) if col in actual_cat_features]
+    lite_cat_features_indices = [i for i, col in enumerate(top_15_features) if col in cat_cols]
 
     print("Training CatBoost (Lite Model)...")
     lite_model = CatBoostClassifier(
@@ -268,9 +270,7 @@ def main():
     lite_model.fit(X_train_lite, y_train)
     prob_test_lite = lite_model.predict_proba(X_test_lite)[:, 1]
 
-    # -------------------------------------------------------------------------
-    # 临床评估执行区
-    # -------------------------------------------------------------------------
+
     print("\n" + "="*50)
     print(" Executing Clinical Evaluations (Test Set)")
     print("="*50)
