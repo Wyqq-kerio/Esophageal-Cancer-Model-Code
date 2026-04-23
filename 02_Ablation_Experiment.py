@@ -1,26 +1,4 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from catboost import CatBoostClassifier, Pool
-from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_curve, roc_auc_score
-from sklearn.model_selection import train_test_split
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-import shap
-import os
 
-# Configuration class
-class ModelConfig:
-    # 请替换为你的 01_Data_and_SHAP.py 跑出来的干净数据的路径
-    # 建议使用主动学习筛选后的 remained.csv
-    DATA_PATH = r"data/result/remained.csv" 
-    
-    CATBOOST_PARAMS = {
-        'depth': 8,
-        'iterations': 400,
         'learning_rate': 0.03,
         'eval_metric': 'Logloss',
         'random_seed': 42,
@@ -35,6 +13,39 @@ class ModelConfig:
     PLOT_LABEL_FONTSIZE = 16
     
     LITE_FEATURES_COUNT = 15  # Lite 模型保留的特征数
+
+    RAW_DATA_PATH_1 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
+    RAW_DATA_PATH_2 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
+
+
+def load_and_preprocess_data(path1: str, path2: str) -> tuple:
+    data = pd.read_csv(path1).dropna()
+    final_data_0S_before = pd.read_csv(path2).dropna()
+    return data, final_data_0S_before
+
+
+def remove_outliers(data: pd.DataFrame, threshold: float = 4) -> pd.DataFrame:
+    z_score = stats.zscore(data)
+    outliers = (z_score > threshold).any(axis=1)
+    data_no_outliers = data[~outliers].dropna()
+    return data_no_outliers
+
+
+def remove_high_correlation_features(data: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+    corr_matrix = data.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+    X_final = data.drop(to_drop, axis=1)
+    return X_final
+
+
+def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
+    if keywords is None:
+        keywords = ['treatment', 'TL', 'original']
+    scaler = StandardScaler()
+    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
+    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
+    return X
 
 # Custom Logloss Objective (保持你最新优化的版本)
 class CustomLoglossObjective(object):
@@ -98,27 +109,24 @@ def plot_unified_roc_curve(roc_data: dict, title: str, config: ModelConfig):
 def main():
     config = ModelConfig()
     
-    # 1. 加载主动学习清洗后的数据
-    print("Loading prepared data...")
-    data = pd.read_csv(config.DATA_PATH)
-    
-    # 假设标签列是 'OS' 或者是 'PFS'
-    label_col = 'OS' if 'OS' in data.columns else 'PFS'
-    X = data.drop([label_col], axis=1, errors='ignore')
-    y = data[label_col].astype(float).astype(int)
-    
-    # 动态匹配分类特征
-    actual_cat_features = [col for col in config.CAT_FEATURES if col in X.columns]
-    X[actual_cat_features] = X[actual_cat_features].astype(str)
-    
-    # 将其他特征转为 float
-    num_features = [col for col in X.columns if col not in actual_cat_features]
-    X[num_features] = X[num_features].astype(float)
+    # 与 Active Learning_1.0.py 严格对齐的数据处理流程
+    data, _ = load_and_preprocess_data(config.RAW_DATA_PATH_1, config.RAW_DATA_PATH_2)
+    data_no_outliers = remove_outliers(data, threshold=4)
+    X_final = remove_high_correlation_features(data_no_outliers, threshold=0.8)
+    X = X_final.drop(['OS', 'OS_m'], axis=1, errors='ignore')
+    y = X_final['OS']
+    X = standardize_selected_features(X)
+
+    cat_features_count = min(13, X.shape[1])
+    cat_features_indices = list(range(cat_features_count))
+    cat_cols = X.columns[cat_features_indices].tolist()
+    X[cat_cols] = X[cat_cols].astype(str)
+    num_cols = X.columns[cat_features_count:]
+    X[num_cols] = X[num_cols].astype(float)
+    y = y.astype(float).astype(int)
     
     # 数据集划分
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    cat_features_indices = [X.columns.get_loc(col) for col in actual_cat_features]
 
     # ==========================================
     # 实验 1: 训练 CatBoost (Full Model - 41 特征)
@@ -152,7 +160,7 @@ def main():
     # 截取 Lite 数据集
     X_train_lite = X_train[top_15_features]
     X_test_lite = X_test[top_15_features]
-    lite_cat_features_indices = [i for i, col in enumerate(top_15_features) if col in actual_cat_features]
+    lite_cat_features_indices = [i for i, col in enumerate(top_15_features) if col in cat_cols]
     
     print(f"\nTraining CatBoost (Lite Model) with {config.LITE_FEATURES_COUNT} features...")
     lite_model = CatBoostClassifier(
@@ -170,8 +178,8 @@ def main():
     
     # 基线模型无法处理字符串类别，需要进行 One-Hot 编码或标签编码
     # 为简单起见，我们对基线模型的数据进行 get_dummies 独热编码处理
-    X_train_encoded = pd.get_dummies(X_train, columns=actual_cat_features, drop_first=True)
-    X_test_encoded = pd.get_dummies(X_test, columns=actual_cat_features, drop_first=True)
+    X_train_encoded = pd.get_dummies(X_train, columns=cat_cols, drop_first=True)
+    X_test_encoded = pd.get_dummies(X_test, columns=cat_cols, drop_first=True)
     
     # 确保训练集和测试集的列完全一致
     X_train_encoded, X_test_encoded = X_train_encoded.align(X_test_encoded, join='left', axis=1, fill_value=0)
