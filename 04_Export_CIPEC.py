@@ -5,12 +5,11 @@ import pandas as pd
 from catboost import CatBoostClassifier, Pool
 import shap
 import warnings
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
-# ------------------------------------------------------------------------------
-# 1. Export Configuration
-# ------------------------------------------------------------------------------
+
 class ExportConfig:
     """
     Configuration for final model training and exporting for CIPEC software.
@@ -29,8 +28,7 @@ class ExportConfig:
     # 分类特征列表 (必须与之前的处理保持一致)
     CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'ECOG', 'T', 'Chemotherapy']
     
-    # 这是你在原代码 Grid Search 中找到的最佳超参数组合
-    # (这里填入你跑出的 best params，目前使用默认优化值)
+
     CATBOOST_BEST_PARAMS = {
         'depth': 8,
         'iterations': 400,
@@ -40,9 +38,16 @@ class ExportConfig:
         'verbose': 100  # 打印训练进度，确保模型正在收敛
     }
 
-# ------------------------------------------------------------------------------
-# 2. Custom Objective (保持你的加权损失逻辑以训练最终模型)
-# ------------------------------------------------------------------------------
+
+def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
+    if keywords is None:
+        keywords = ['treatment', 'TL', 'original']
+    scaler = StandardScaler()
+    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
+    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
+    return X
+
+
 class CustomLoglossObjective(object):
     def __init__(self, penalty=1.3, reward_factor=1.8):
         self.penalty = penalty
@@ -74,15 +79,13 @@ class CustomLoglossObjective(object):
             result.append((der1_combined, der2_combined))
         return result
 
-# ------------------------------------------------------------------------------
-# 3. Main Export Pipeline
-# ------------------------------------------------------------------------------
+
 def main():
     config = ExportConfig()
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     
     print("="*60)
-    print("🚀 Starting CIPEC Model Export Pipeline")
+    print("Starting CIPEC Model Export Pipeline")
     print("="*60)
 
     # 1. 加载所有可用数据 (用于最终生产模型，不再切分测试集，最大化利用数据)
@@ -94,17 +97,17 @@ def main():
     drop_cols = [config.TARGET_LABEL, "OS_m", "PFS_m"]  # 排除所有标签和时间列
     X = data.drop([col for col in drop_cols if col in data.columns], axis=1)
     
-    # 分类变量与连续变量类型处理
-    actual_cat_features = [col for col in config.CAT_FEATURES if col in X.columns]
-    X[actual_cat_features] = X[actual_cat_features].astype(str)
-    num_features = [col for col in X.columns if col not in actual_cat_features]
-    X[num_features] = X[num_features].astype(float)
-    
-    full_cat_indices = [X.columns.get_loc(col) for col in actual_cat_features]
+    # 与 Active Learning_1.0.py 保持一致：标准化 + 前13列作为分类特征
+    X = standardize_selected_features(X)
+    cat_features_count = min(13, X.shape[1])
+    full_cat_indices = list(range(cat_features_count))
+    cat_cols = X.columns[full_cat_indices].tolist()
+    X[cat_cols] = X[cat_cols].astype(str)
+    num_cols = X.columns[cat_features_count:]
+    X[num_cols] = X[num_cols].astype(float)
 
-    # =========================================================================
-    # Phase 1: Train & Export Full Model
-    # =========================================================================
+
+    #  Train & Export Full Model
     print(f"\n[1/4] Training FULL Model on all {len(X)} samples with {X.shape[1]} features...")
     full_model = CatBoostClassifier(
         loss_function=CustomLoglossObjective(),
@@ -117,9 +120,8 @@ def main():
     full_model.save_model(full_model_path)
     print(f"✅ Full model saved to: {full_model_path}")
 
-    # =========================================================================
-    # Phase 2: SHAP Extraction for Lite Model
-    # =========================================================================
+
+    # SHAP Extraction for Lite Model
     print(f"\n[2/4] Running SHAP to extract Top-{config.LITE_FEATURES_COUNT} features for Lite Model...")
     explainer = shap.TreeExplainer(full_model)
     shap_values = explainer.shap_values(X)
@@ -131,12 +133,11 @@ def main():
     
     print(f"Top 15 Features: {top_15_features}")
 
-    # =========================================================================
-    # Phase 3: Train & Export Lite Model
-    # =========================================================================
+
+    # Train & Export Lite Model
     print(f"\n[3/4] Training LITE Model on top {config.LITE_FEATURES_COUNT} features...")
     X_lite = X[top_15_features]
-    lite_cat_indices = [i for i, col in enumerate(top_15_features) if col in actual_cat_features]
+    lite_cat_indices = [i for i, col in enumerate(top_15_features) if col in cat_cols]
     
     lite_model = CatBoostClassifier(
         loss_function=CustomLoglossObjective(),
@@ -149,9 +150,7 @@ def main():
     lite_model.save_model(lite_model_path)
     print(f"✅ Lite model saved to: {lite_model_path}")
 
-    # =========================================================================
-    # Phase 4: Export GUI Configuration JSON
-    # =========================================================================
+
     print("\n[4/4] Exporting GUI Configuration JSON...")
     
     # 获取特征顺序，供 GUI 开发者构建输入表单时参考
@@ -160,13 +159,13 @@ def main():
             "model_file": "cipec_full_model.cbm",
             "feature_count": len(X.columns),
             "expected_features": list(X.columns),
-            "categorical_features": actual_cat_features
+            "categorical_features": cat_cols
         },
         "lite_model": {
             "model_file": "cipec_lite_model.cbm",
             "feature_count": len(top_15_features),
             "expected_features": top_15_features,
-            "categorical_features": [col for col in top_15_features if col in actual_cat_features]
+            "categorical_features": [col for col in top_15_features if col in cat_cols]
         }
     }
     
@@ -174,8 +173,8 @@ def main():
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(gui_config, f, indent=4, ensure_ascii=False)
         
-    print(f"✅ GUI configuration saved to: {config_path}")
-    print("\n🎉 Export pipeline completed successfully! You can now copy the 'cipec_export' folder to your software.")
+    print(f" GUI configuration saved to: {config_path}")
+    print("\n Export pipeline completed successfully! You can now copy the 'cipec_export' folder to your software.")
 
 if __name__ == "__main__":
     main()
