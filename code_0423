@@ -1,1 +1,353 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
+from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_curve, auc, accuracy_score, roc_auc_score, mutual_info_score
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from catboost import Pool
+from catboost import CatBoost
+from sklearn.feature_selection import mutual_info_classif, RFECV, RFE
+from scipy.interpolate import make_interp_spline
+from sklearn.linear_model import Lasso
+#import torch
+#import torch.nn as nn
+#import torch.optim as optim
+#from torch.distributions import Categorical
+#import shap
+import math
+import os
+
+def load_and_preprocess_data(path1: str, path2: str) -> tuple:
+    """
+    Load raw data and perform initial preprocessing (drop NA values)
+    Args:
+        path1: Path to the first CSV file (before OS 7.19.csv)
+        path2: Path to the second CSV file (EC_before_Treatment 7.12 OS after preprocessing.csv)
+    Returns:
+        data: Preprocessed first dataset (NA dropped)
+        final_data_0S_before: Preprocessed second dataset (NA dropped)
+    """
+    data = pd.read_csv(path1).dropna()
+    final_data_0S_before = pd.read_csv(path2).dropna()
+    return data, final_data_0S_before
+
+def remove_outliers(data: pd.DataFrame, threshold: float = 4) -> pd.DataFrame:
+    """
+    Remove outliers using Z-score method
+    Args:
+        data: Input DataFrame
+        threshold: Z-score threshold for outlier detection
+    Returns:
+        data_no_outliers: DataFrame with outliers removed
+    """
+    z_score = stats.zscore(data)
+    outliers = (z_score > threshold).any(axis=1)
+    data_no_outliers = data[~outliers].dropna()
+    return data_no_outliers
+
+def remove_high_correlation_features(data: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+    """
+    Remove highly correlated features to avoid multicollinearity
+    Args:
+        data: Input DataFrame (no outliers)
+        threshold: Correlation coefficient threshold
+    Returns:
+        X_final: DataFrame with highly correlated features removed
+    """
+    corr_matrix = data.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
+    X_final = data.drop(to_drop, axis=1)
+    return X_final
+
+def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
+    """
+    Standardize specific features based on keyword matching in column names
+    Args:
+        X: Feature DataFrame
+        keywords: List of keywords to identify features for standardization
+    Returns:
+        X: DataFrame with selected features standardized
+    """
+    if keywords is None:
+        keywords = ['treatment', 'TL', 'original']
+    
+    scaler = StandardScaler()
+    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
+    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
+    return X
+
+class CustomLoglossObjective(object):
+    """
+    Custom Logloss Objective for CatBoost with combined loss functions (Quantile + Logloss)
+    Includes penalty and reward mechanisms based on prediction confidence
+    """
+    def __init__(self, penalty: float = 1.3, alpha: float = 0.5, mrf_weight: float = 0.5, reward_factor: float = 1.8):
+        self.alpha = alpha
+        self.penalty = penalty
+        self.mrf_weight = mrf_weight
+        self.reward_factor = reward_factor
+
+    def stable_log(self, x: float, eps: float = 1e-10) -> float:
+        """Numerically stable log calculation to avoid division by zero"""
+        return np.log1p(x + eps) if x > 1 - eps else np.log(x + eps)
+
+    def adjust_factors_based_on_performance(self, validation_performance: object):
+        """
+        Dynamically adjust reward and penalty factors based on validation performance
+        Args:
+            validation_performance: Object with 'decreased' attribute indicating performance change
+        """
+        if validation_performance.decreased:
+            self.reward_factor *= 1.1
+            self.penalty *= 1.1
+        else:
+            self.reward_factor *= 0.9
+            self.penalty *= 0.9
+
+    def calc_ders_range(self, approxes: list, targets: list, weights: list = None) -> list:
+        """
+        Calculate first and second derivatives for CatBoost custom objective
+        Args:
+            approxes: Model predictions
+            targets: True labels
+            weights: Sample weights (optional)
+        Returns:
+            result: List of (first derivative, second derivative) pairs
+        """
+        assert len(approxes) == len(targets)
+        if weights is not None:
+            assert len(weights) == len(approxes)
+
+        exponents = [np.exp(a) for a in approxes]
+        gamma = 2
+        beta = 0.5
+        result = []
+
+        for idx in range(len(targets)):
+            p = exponents[idx] / (1 + exponents[idx])
+            penalty = 1.0
+
+            # Apply penalty for overconfident wrong predictions
+            if (targets[idx] == 1 and p < 0.2) or (targets[idx] == 0 and p > 0.8):
+                penalty *= self.penalty
+
+            # Apply reward for confident correct predictions
+            reward_factor = 1.0
+            if targets[idx] == 1 and p > 0.8:
+                reward_factor *= self.reward_factor
+            elif targets[idx] == 0 and p < 0.2:
+                reward_factor *= self.reward_factor
+
+            # Logloss derivatives
+            der1_log = (1 - p) * self.penalty if targets[idx] > 0.0 else -p * self.penalty
+            der2_log = -p * (1 - p)
+
+            # MSE derivatives (unused in final combination)
+            der1_mse = 2 * (p - targets[idx])
+            der2_mse = 2
+
+            # Huber loss derivatives (unused in final combination)
+            delta = 0.1
+            der1_huber = (targets[idx] - p) if abs(targets[idx] - p) <= delta else np.sign(targets[idx] - p) * delta
+            der2_huber = 1 if abs(targets[idx] - p) <= delta else 0
+
+            # Hinge loss derivatives (unused in final combination)
+            margin = 1 - targets[idx] * approxes[idx]
+            der1_hinge = -targets[idx] if margin < 0 else 0
+            der2_hinge = 0
+
+            # Quantile loss derivatives
+            q = 0.5
+            der1_quantile = q * (p - p**2) if targets[idx] - p >= 0 else (q - 1) * (p - p**2)
+            der2_quantile = 0
+
+            # Focal loss derivatives (unused in final combination)
+            if targets[idx] > 0.0:
+                focal_loss = -beta * (1 - p) ** gamma * np.log(p + 1e-40)
+                der1_focal = beta * gamma * (1 - p) ** (gamma - 1) * np.log(p + 1e-40) - beta * (1 - p) ** gamma * 1 / (p + 1e-40)
+            else:
+                focal_loss = -((1 - beta) * p) ** gamma * np.log(1 - p + 1e-40)
+                der1_focal = -gamma * p ** (gamma - 1) * np.log(1 - p + 1e-40) + p ** gamma * 1 / (1 - p + 1e-40)
+            der2_focal = 0
+
+            # Class frequency weight (unused in final combination)
+            class_frequency = np.mean(targets)
+            weight_factor = 1 / class_frequency if targets[idx] == 1 else class_frequency
+
+            # Combine quantile and logloss derivatives
+            der1_combined = (der1_quantile + der1_log) / 2
+            der2_combined = (der2_quantile + der2_log) / 2
+
+            # Apply sample weights if provided
+            if weights is not None:
+                der1_combined *= weights[idx]
+                der2_combined *= weights[idx]
+
+            result.append((der1_combined, der2_combined))
+
+        return result
+
+def active_learning_sample_selection_with_bald(X_train: pd.DataFrame, y_train: pd.Series, 
+                                               initial_labeled_samples: int = 50, 
+                                               num_iterations: int = 32, 
+                                               num_samples_to_label: int = 10) -> tuple:
+    """
+    Active Learning sample selection using BALD (Bayesian Active Learning by Disagreement)
+    Compares predictions from CatBoost and RandomForest to select uncertain samples
+    Args:
+        X_train: Training features
+        y_train: Training labels
+        initial_labeled_samples: Number of initial labeled samples
+        num_iterations: Number of active learning iterations
+        num_samples_to_label: Number of samples to label per iteration
+    Returns:
+        X_labeled_bald: Labeled features (DataFrame)
+        y_labeled_bald: Labeled labels (DataFrame)
+        X_removed: Unselected features (numpy array)
+        y_removed: Unselected labels (numpy array)
+    """
+    # Convert to numpy arrays for index manipulation
+    X_train_np = np.array(X_train)
+    y_train_np = np.array(y_train)
+    n_samples = len(X_train_np)
+
+    # Initialize labeled set with initial samples
+    X_labeled = X_train_np[:initial_labeled_samples]
+    y_labeled = y_train_np[:initial_labeled_samples]
+    labeled_indices = set(range(min(initial_labeled_samples, n_samples)))
+
+    # Initialize models
+    custom_loss = CustomLoglossObjective()
+    catboost_model = CatBoostClassifier(cat_features=list(range(13)), 
+                                        loss_function=custom_loss, 
+                                        eval_metric='Logloss', 
+                                        depth=8, 
+                                        iterations=400, 
+                                        learning_rate=0.03)
+    rf_model = RandomForestClassifier(n_estimators=100)
+
+    for _ in range(num_iterations):
+        # Get unlabeled samples based on true original indices
+        unlabeled_indices = np.array([i for i in range(n_samples) if i not in labeled_indices], dtype=int)
+        X_unlabeled = X_train_np[unlabeled_indices]
+        y_unlabeled = y_train_np[unlabeled_indices]
+
+        if len(X_unlabeled) < num_samples_to_label:
+            break  # Stop if no more unlabeled samples
+
+        # Train models on labeled data
+        catboost_model.fit(X_labeled, y_labeled)
+        rf_model.fit(X_labeled, y_labeled)
+
+        # Get prediction probabilities
+        pred_cat = catboost_model.predict_proba(X_unlabeled)
+        pred_rf = rf_model.predict_proba(X_unlabeled)
+
+        # Calculate disagreement (BALD score)
+        disagreements = np.abs(pred_cat - pred_rf).mean(axis=1)
+
+        # Select samples with highest disagreement (indices in X_unlabeled)
+        selected_indices = np.argsort(disagreements)[-num_samples_to_label:]
+        selected_original_indices = unlabeled_indices[selected_indices]
+
+        # Add selected samples to labeled set
+        X_labeled = np.concatenate((X_labeled, X_unlabeled[selected_indices]))
+        y_labeled = np.concatenate((y_labeled, y_unlabeled[selected_indices]))
+        labeled_indices.update(selected_original_indices.tolist())
+
+    # Identify removed samples (unselected)
+    removed_indices = np.array([i for i in range(n_samples) if i not in labeled_indices], dtype=int)
+    X_removed = X_train_np[removed_indices] if len(removed_indices) > 0 else np.empty((0, X_train_np.shape[1]))
+    y_removed = y_train_np[removed_indices] if len(removed_indices) > 0 else np.empty((0,))
+
+    # Convert labeled data back to DataFrame
+    X_labeled_bald = pd.DataFrame(X_labeled, columns=X_train.columns)
+    y_labeled_bald = pd.DataFrame(y_labeled, columns=['OS'])
+
+    return X_labeled_bald, y_labeled_bald, X_removed, y_removed
+
+def save_results(labeled_samples: pd.DataFrame, unlabeled_samples: pd.DataFrame, 
+                 removed_sample: pd.DataFrame, sample_labeld_bald: pd.DataFrame,
+                 save_paths: dict = None) -> None:
+    """
+    Save processed data to CSV files
+    Args:
+        labeled_samples: Labeled samples from active learning
+        unlabeled_samples: Unlabeled samples from active learning
+        removed_sample: Removed samples (unselected)
+        sample_labeld_bald: Combined labeled features and labels
+        save_paths: Dictionary of save paths for each file (replace "your path" with actual path)
+    """
+    if save_paths is None:
+        output_dir = os.path.join("data", "result")
+        os.makedirs(output_dir, exist_ok=True)
+        save_paths = {
+            'labeled': os.path.join(output_dir, "labeled.csv"),
+            'unlabeled': os.path.join(output_dir, "unlabeled.csv"),
+            'removed': os.path.join(output_dir, "removed.csv"),
+            'remained': os.path.join(output_dir, "remained.csv")
+        }
+
+    labeled_samples.to_csv(save_paths['labeled'], index=False)
+    unlabeled_samples.to_csv(save_paths['unlabeled'], index=False)
+    removed_sample.to_csv(save_paths['removed'], index=False)
+    sample_labeld_bald.to_csv(save_paths['remained'], index=False)
+
+def main():
+    """Main execution function for the entire pipeline"""
+    # 1. Set file paths (replace "your path" with your actual local file path, use raw string r"" to avoid escape errors)
+    path1 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
+    path2 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
+
+    # 2. Load and preprocess data
+    data, final_data_0S_before = load_and_preprocess_data(path1, path2)
+    data_no_outliers = remove_outliers(data, threshold=4)
+    X_final = remove_high_correlation_features(data_no_outliers, threshold=0.8)
+    print("Final features after outlier and correlation removal:\n", X_final)
+
+    # 3. Prepare features and labels
+    X = X_final.drop(['OS', 'OS_m'], axis=1)
+    y = X_final['OS']
+
+    # 4. Standardize selected features
+    X = standardize_selected_features(X)
+
+    # 5. Convert to string type (for categorical handling in CatBoost)
+    X = X.astype(str)
+    y = y.astype(str)
+
+    # 6. Train-test split (unused in active learning but kept for original pipeline)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    print("\nTest set features:\n", X_test)
+    X_test_final = X_final.drop(X_train.index)
+    print("\nTest set final data:\n", X_test_final)
+    print("\nTraining set features:\n", X_train)
+
+    # 7. Active learning sample selection
+    X_labeled_bald, y_labeled_bald, X_removed, y_removed = active_learning_sample_selection_with_bald(
+        X_train, y_train, initial_labeled_samples=50, num_iterations=32, num_samples_to_label=10
+    )
+
+    # 8. Prepare result DataFrames
+    removed_sample = pd.concat([pd.DataFrame(X_removed, columns=X_train.columns), 
+                                pd.DataFrame(y_removed, columns=['OS'])], axis=1)
+    sample_labeld_bald = pd.concat([X_labeled_bald, y_labeled_bald], axis=1)
+
+    # 9. Get labeled/unlabeled samples from original data
+    # Reindex to match original data (fix index mismatch in original code)
+    labeled_indices = X_train.iloc[X_labeled_bald.index].index
+    labeled_samples = X_final.loc[labeled_indices]
+    unlabeled_samples = X_final.drop(labeled_indices)
+
+    # 10. Save results
+    save_results(labeled_samples, unlabeled_samples, removed_sample, sample_labeld_bald)
+
+if __name__ == "__main__":
+    main()
 
