@@ -5,7 +5,6 @@ import pandas as pd
 from catboost import CatBoostClassifier, Pool
 import shap
 import warnings
-from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
@@ -26,30 +25,22 @@ class ExportConfig:
     LITE_FEATURES_COUNT = 15  # Lite 模型保留的特征数
     
     # 分类特征列表 (必须与之前的处理保持一致)
-    CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'ECOG', 'T', 'Chemotherapy']
+    CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'PTV_Dose', 'GTV_Dose', 'ECOG', 'T', 'Chemotherapy']
     
 
     CATBOOST_BEST_PARAMS = {
         'depth': 8,
         'iterations': 400,
-        'learning_rate': 0.03,
+        'learning_rate': 0.1,
+        'early_stopping_rounds': 50,
         'eval_metric': 'Logloss',
         'random_seed': 42,
         'verbose': 100  # 打印训练进度，确保模型正在收敛
     }
 
 
-def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
-    if keywords is None:
-        keywords = ['treatment', 'TL', 'original']
-    scaler = StandardScaler()
-    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
-    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
-    return X
-
-
 class CustomLoglossObjective(object):
-    def __init__(self, penalty=1.3, reward_factor=1.8):
+    def __init__(self, penalty=2, reward_factor=0.9):
         self.penalty = penalty
         self.reward_factor = reward_factor
 
@@ -66,7 +57,7 @@ class CustomLoglossObjective(object):
 
             der1_log = (1 - p) * self.penalty if targets[idx] > 0.0 else -p * self.penalty
             der2_log = -p * (1 - p)
-            q = 0.5
+            q = 0.6
             der1_quantile = q * (p - p**2) if targets[idx] - p >= 0 else (q - 1) * (p - p**2)
             der2_quantile = 0
 
@@ -97,14 +88,12 @@ def main():
     drop_cols = [config.TARGET_LABEL, "OS_m", "PFS_m"]  # 排除所有标签和时间列
     X = data.drop([col for col in drop_cols if col in data.columns], axis=1)
     
-    # 与 Active Learning_1.0.py 保持一致：标准化 + 前13列作为分类特征
-    X = standardize_selected_features(X)
-    cat_features_count = min(13, X.shape[1])
-    full_cat_indices = list(range(cat_features_count))
+    # 与原模型一致：前13列作为分类特征
+    full_cat_indices = list(range(min(13, X.shape[1])))
     cat_cols = X.columns[full_cat_indices].tolist()
     X[cat_cols] = X[cat_cols].astype(str)
-    num_cols = X.columns[cat_features_count:]
-    X[num_cols] = X[num_cols].astype(float)
+    num_features = [col for col in X.columns if col not in cat_cols]
+    X[num_features] = X[num_features].astype(float)
 
 
     #  Train & Export Full Model
