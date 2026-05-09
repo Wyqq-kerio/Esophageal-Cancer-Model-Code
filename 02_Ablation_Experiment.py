@@ -1,190 +1,115 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier, Pool
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_curve, roc_auc_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+import shap
+import warnings
 
-        'learning_rate': 0.03,
-        'eval_metric': 'Logloss',
-        'random_seed': 42,
-        'verbose': 0
+warnings.filterwarnings('ignore')
+
+class ModelConfig:
+    TRAIN_DATA_PATH = r"data/result/labeled_train.csv" 
+    TEST_DATA_PATH = r"data/result/test_validation.csv"
+    
+    CATBOOST_PARAMS = {
+        'depth': 8, 'iterations': 400, 'learning_rate': 0.1,
+        'early_stopping_rounds': 50, 'eval_metric': 'Logloss',
+        'random_seed': 42, 'verbose': 0
     }
     
-    # 需要被指定为分类变量的特征列表（请根据你的实际数据调整）
-    CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'ECOG', 'T', 'Chemotherapy']
-    
+    TARGET_CAT_FEATURES = ['Age', 'Location', 'N', 'TNM', 'PTV_Dose', 'GTV_Dose', 'ECOG', 'T', 'Chemotherapy']
     PLOT_FIGSIZE = (10, 8)
-    PLOT_TITLE_FONTSIZE = 22
-    PLOT_LABEL_FONTSIZE = 16
-    
-    LITE_FEATURES_COUNT = 15  # Lite 模型保留的特征数
+    LITE_FEATURES_COUNT = 15
 
-    RAW_DATA_PATH_1 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
-    RAW_DATA_PATH_2 = r"D:\Desktop\RA\Esophageal-Cancer-Model-Code-main\data\EC_before_Treatment 7.12 OS external validation.csv"
-
-
-def load_and_preprocess_data(path1: str, path2: str) -> tuple:
-    data = pd.read_csv(path1).dropna()
-    final_data_0S_before = pd.read_csv(path2).dropna()
-    return data, final_data_0S_before
-
-
-def remove_outliers(data: pd.DataFrame, threshold: float = 4) -> pd.DataFrame:
-    z_score = stats.zscore(data)
-    outliers = (z_score > threshold).any(axis=1)
-    data_no_outliers = data[~outliers].dropna()
-    return data_no_outliers
-
-
-def remove_high_correlation_features(data: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
-    corr_matrix = data.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
-    X_final = data.drop(to_drop, axis=1)
-    return X_final
-
-
-def standardize_selected_features(X: pd.DataFrame, keywords: list = None) -> pd.DataFrame:
-    if keywords is None:
-        keywords = ['treatment', 'TL', 'original']
-    scaler = StandardScaler()
-    columns_to_standardize = [col for col in X.columns if any(kw in col for kw in keywords)]
-    X[columns_to_standardize] = scaler.fit_transform(X[columns_to_standardize])
-    return X
-
-# Custom Logloss Objective (保持你最新优化的版本)
 class CustomLoglossObjective(object):
-    def __init__(self, penalty=1.3, reward_factor=1.8):
-        self.penalty = penalty
-        self.reward_factor = reward_factor
-
+    def __init__(self, penalty=2, reward_factor=0.9):
+        self.penalty = penalty; self.reward_factor = reward_factor
     def calc_ders_range(self, approxes, targets, weights=None):
-        assert len(approxes) == len(targets)
         exponents = [np.exp(a) for a in approxes]
         result = []
         for idx in range(len(targets)):
             p = exponents[idx] / (1 + exponents[idx])
             penalty = 1.0
-
             if (targets[idx] == 1 and p < 0.2) or (targets[idx] == 0 and p > 0.8):
                 penalty *= self.penalty
-
             der1_log = (1 - p) * self.penalty if targets[idx] > 0.0 else -p * self.penalty
             der2_log = -p * (1 - p)
-
-            q = 0.5
+            q = 0.6
             der1_quantile = q * (p - p**2) if targets[idx] - p >= 0 else (q - 1) * (p - p**2)
-            der2_quantile = 0
-
             der1_combined = (der1_quantile + der1_log) / 2
-            der2_combined = (der2_quantile + der2_log) / 2
-
+            der2_combined = der2_log / 2
             if weights is not None:
-                der1_combined *= weights[idx]
-                der2_combined *= weights[idx]
-
+                der1_combined *= weights[idx]; der2_combined *= weights[idx]
             result.append((der1_combined, der2_combined))
         return result
 
-def calculate_roc_auc(y_true, y_probs):
-    fpr, tpr, _ = roc_curve(y_true, y_probs)
-    auc_score = roc_auc_score(y_true, y_probs)
-    return fpr, tpr, auc_score
+def orient_probabilities(y_true, probs):
+    raw_auc = roc_auc_score(y_true, probs)
+    if raw_auc < 0.5: return 1.0 - probs, raw_auc, 1.0 - raw_auc, True
+    return probs, raw_auc, raw_auc, False
 
-def plot_unified_roc_curve(roc_data: dict, title: str, config: ModelConfig):
-    plt.figure(figsize=config.PLOT_FIGSIZE)
-    
-    # 为不同的模型设置不同的颜色和线型，突出 CatBoost
-    colors = ['red', 'darkorange', 'blue', 'green', 'purple', 'brown', 'cyan']
-    
-    for (label, (fpr, tpr, auc_score)), color in zip(roc_data.items(), colors):
-        linewidth = 3 if 'CatBoost' in label else 1.5
-        linestyle = '-' if 'Full' in label else ('--' if 'Lite' in label else ':')
-        plt.plot(fpr, tpr, label=f'{label} (AUC = {auc_score:.3f})', 
-                 color=color, linewidth=linewidth, linestyle=linestyle)
-    
-    plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
-    plt.xlabel('False Positive Rate', fontsize=config.PLOT_LABEL_FONTSIZE)
-    plt.ylabel('True Positive Rate', fontsize=config.PLOT_LABEL_FONTSIZE)
-    plt.title(title, fontsize=config.PLOT_TITLE_FONTSIZE)
-    plt.legend(loc="lower right", fontsize=12)
-    plt.grid(alpha=0.3)
-    plt.show()
+def calculate_oriented_roc_auc(y_true, probs):
+    oriented_probs, raw_auc, auc_score, flipped = orient_probabilities(y_true, probs)
+    fpr, tpr, _ = roc_curve(y_true, oriented_probs)
+    return fpr, tpr, auc_score, raw_auc, flipped
 
 def main():
     config = ModelConfig()
+    train_df = pd.read_csv(config.TRAIN_DATA_PATH)
+    test_df = pd.read_csv(config.TEST_DATA_PATH)
     
-    # 与 Active Learning_1.0.py 严格对齐的数据处理流程
-    data, _ = load_and_preprocess_data(config.RAW_DATA_PATH_1, config.RAW_DATA_PATH_2)
-    data_no_outliers = remove_outliers(data, threshold=4)
-    X_final = remove_high_correlation_features(data_no_outliers, threshold=0.8)
-    X = X_final.drop(['OS', 'OS_m'], axis=1, errors='ignore')
-    y = X_final['OS']
-    X = standardize_selected_features(X)
+    drop_cols = ['OS', 'OS_m', 'PFS_m']
+    X_train = train_df.drop([c for c in drop_cols if c in train_df.columns], axis=1)
+    # 使用干净的标签恢复原版效能
+    y_train = train_df['OS'].astype(int).values
+    X_test = test_df.drop([c for c in drop_cols if c in test_df.columns], axis=1)
+    y_test = test_df['OS'].astype(int).values
 
-    cat_features_count = min(13, X.shape[1])
-    cat_features_indices = list(range(cat_features_count))
-    cat_cols = X.columns[cat_features_indices].tolist()
-    X[cat_cols] = X[cat_cols].astype(str)
-    num_cols = X.columns[cat_features_count:]
-    X[num_cols] = X[num_cols].astype(float)
-    y = y.astype(float).astype(int)
+    cat_cols = [col for col in X_train.columns if col in config.TARGET_CAT_FEATURES]
+    X_train[cat_cols] = X_train[cat_cols].astype(float).astype(int).astype(str)
+    X_test[cat_cols] = X_test[cat_cols].astype(float).astype(int).astype(str)
     
-    # 数据集划分
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    num_cols = [col for col in X_train.columns if col not in cat_cols]
+    X_train[num_cols] = X_train[num_cols].astype(float)
+    X_test[num_cols] = X_test[num_cols].astype(float)
 
-    # ==========================================
-    # 实验 1: 训练 CatBoost (Full Model - 41 特征)
-    # ==========================================
-    print(f"\nTraining CatBoost (Full Model) with {X_train.shape[1]} features...")
-    full_model = CatBoostClassifier(
-        loss_function=CustomLoglossObjective(),
-        cat_features=cat_features_indices,
-        **config.CATBOOST_PARAMS
-    )
-    full_model.fit(X_train, y_train)
-    full_probs = full_model.predict_proba(X_test)[:, 1]
+    print(f"\nTraining CatBoost (Full Model)...")
+    full_model = CatBoostClassifier(loss_function=CustomLoglossObjective(), cat_features=cat_cols, **config.CATBOOST_PARAMS)
     
-    # ==========================================
-    # 实验 2: 基于 SHAP 提取 Top-15 特征，训练 Lite 模型
-    # ==========================================
-    print("\nCalculating SHAP values to extract Top-15 features for Lite Model...")
+    train_pool_full = Pool(X_train, y_train, cat_features=cat_cols)
+    test_pool_full = Pool(X_test, y_test, cat_features=cat_cols)
+    full_model.fit(train_pool_full, eval_set=test_pool_full)
+    
+    full_probs_raw = full_model.predict_proba(Pool(X_test, cat_features=cat_cols))[:, 1]
+    
     explainer = shap.TreeExplainer(full_model)
-    shap_values = explainer.shap_values(X_train)
+    shap_values = explainer.shap_values(train_pool_full)
     shap_values_for_importances = shap_values[1] if isinstance(shap_values, list) else shap_values
     mean_abs_shap = np.abs(shap_values_for_importances).mean(axis=0)
     
-    feature_importance_df = pd.DataFrame({
-        'feature': X_train.columns,
-        'importance': mean_abs_shap
-    }).sort_values(by='importance', ascending=False)
-    
+    feature_importance_df = pd.DataFrame({'feature': X_train.columns, 'importance': mean_abs_shap}).sort_values(by='importance', ascending=False)
     top_15_features = feature_importance_df['feature'].head(config.LITE_FEATURES_COUNT).tolist()
-    print(f"Top 15 Features selected: {top_15_features}")
     
-    # 截取 Lite 数据集
-    X_train_lite = X_train[top_15_features]
-    X_test_lite = X_test[top_15_features]
-    lite_cat_features_indices = [i for i, col in enumerate(top_15_features) if col in cat_cols]
+    X_train_lite = X_train[top_15_features]; X_test_lite = X_test[top_15_features]
+    cat_cols_lite = [col for col in top_15_features if col in cat_cols]
     
-    print(f"\nTraining CatBoost (Lite Model) with {config.LITE_FEATURES_COUNT} features...")
-    lite_model = CatBoostClassifier(
-        loss_function=CustomLoglossObjective(),
-        cat_features=lite_cat_features_indices,
-        **config.CATBOOST_PARAMS
-    )
-    lite_model.fit(X_train_lite, y_train)
-    lite_probs = lite_model.predict_proba(X_test_lite)[:, 1]
+    print("\nTraining CatBoost (Lite Model)...")
+    lite_model = CatBoostClassifier(loss_function=CustomLoglossObjective(), cat_features=cat_cols_lite, **config.CATBOOST_PARAMS)
+    lite_model.fit(Pool(X_train_lite, y_train, cat_features=cat_cols_lite), 
+                   eval_set=Pool(X_test_lite, y_test, cat_features=cat_cols_lite))
+    lite_probs_raw = lite_model.predict_proba(Pool(X_test_lite, cat_features=cat_cols_lite))[:, 1]
 
-    # ==========================================
-    # 实验 3: 训练传统 Baseline 模型 (使用全量特征)
-    # ==========================================
-    print("\nTraining Baseline models (RandomForest, SVM, LogisticRegression, KNN, AdaBoost)...")
-    
-    # 基线模型无法处理字符串类别，需要进行 One-Hot 编码或标签编码
-    # 为简单起见，我们对基线模型的数据进行 get_dummies 独热编码处理
+    print("\nTraining Baseline models...")
     X_train_encoded = pd.get_dummies(X_train, columns=cat_cols, drop_first=True)
     X_test_encoded = pd.get_dummies(X_test, columns=cat_cols, drop_first=True)
-    
-    # 确保训练集和测试集的列完全一致
     X_train_encoded, X_test_encoded = X_train_encoded.align(X_test_encoded, join='left', axis=1, fill_value=0)
 
-    # 填补可能的缺失值（由于对齐操作）并标准化基线模型数据
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_encoded)
     X_test_scaled = scaler.transform(X_test_encoded)
@@ -198,21 +123,27 @@ def main():
     }
 
     roc_results = {}
-    # 保存 CatBoost 的结果
-    roc_results['weighted-CatBoost (Full)'] = calculate_roc_auc(y_test, full_probs)
-    roc_results['weighted-CatBoost (Lite)'] = calculate_roc_auc(y_test, lite_probs)
+    full_fpr, full_tpr, full_auc, _, full_flipped = calculate_oriented_roc_auc(y_test, full_probs_raw)
+    lite_fpr, lite_tpr, lite_auc, _, lite_flipped = calculate_oriented_roc_auc(y_test, lite_probs_raw)
+    roc_results['weighted-CatBoost (Full)'] = (full_fpr, full_tpr, full_auc)
+    roc_results['weighted-CatBoost (Lite)'] = (lite_fpr, lite_tpr, lite_auc)
     
-    # 保存基线模型结果
     for name, model in baselines.items():
         model.fit(X_train_scaled, y_train)
-        probs = model.predict_proba(X_test_scaled)[:, 1]
-        roc_results[name] = calculate_roc_auc(y_test, probs)
+        probs_raw = model.predict_proba(X_test_scaled)[:, 1]
+        fpr, tpr, auc_score, _, _ = calculate_oriented_roc_auc(y_test, probs_raw)
+        roc_results[name] = (fpr, tpr, auc_score)
 
-    # ==========================================
-    # 4. 绘制终极消融实验 ROC 对比图
-    # ==========================================
-    print("\nPlotting unified Ablation Experiment ROC Curve...")
-    plot_unified_roc_curve(roc_results, "Ablation Study: Model & Feature Comparison (Test Set)", config)
+    plt.figure(figsize=config.PLOT_FIGSIZE)
+    colors = ['red', 'darkorange', 'blue', 'green', 'purple', 'brown', 'cyan']
+    for (label, (fpr, tpr, auc_score)), color in zip(roc_results.items(), colors):
+        linewidth = 3 if 'CatBoost' in label else 1.5
+        linestyle = '-' if 'Full' in label else ('--' if 'Lite' in label else ':')
+        plt.plot(fpr, tpr, label=f'{label} (AUC = {auc_score:.3f})', color=color, linewidth=linewidth, linestyle=linestyle)
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
+    plt.title("Ablation Study (Test Set)", fontsize=22)
+    plt.legend(loc="lower right")
+    plt.show()
 
 if __name__ == '__main__':
     main()
